@@ -8,6 +8,7 @@ import time
 import urllib.parse
 from collections import Counter
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -544,7 +545,7 @@ def main():
     # 10-MINUTE HEARTBEAT
     # -------------------------------------------------
 
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
     if now.minute % 10 == 0:
 
