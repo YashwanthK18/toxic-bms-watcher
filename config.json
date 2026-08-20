@@ -1,0 +1,12 @@
+{
+  "detector": "venue_date",
+  "movie": "Toxic: A Fairy Tale for Grown-ups",
+  "requested_date": "20260826",
+  "venue_codes": [
+    "URBL",
+    "VCCB",
+    "PVOO"
+  ],
+  "venue_label": "Urvashi Cinema / Victory Cinema / PVR Orion Mall",
+  "url_template": "https://in.bookmyshow.com/movies/bengaluru/toxic-a-fairy-tale-for-grownups/buytickets/ET00378770/{date}"
+}
