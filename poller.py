@@ -375,7 +375,7 @@ def send_status_update(
         [
             "",
             f"🕐 Checked: {checked_at}",
-            "🔄 Next check: ~1 minute",
+            "🔄 Next check: ~5 minute",
         ]
     )
 
