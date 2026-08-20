@@ -547,7 +547,7 @@ def main():
 
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-    if now.minute % 10 == 0:
+    if now.minute % 5 == 0 or os.environ.get("MANUAL_TEST") == "true":
 
         checked_at = now.strftime(
             "%I:%M %p"
