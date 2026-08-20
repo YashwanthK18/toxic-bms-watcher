@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-Ticket-booking watcher.
-
-Polls a URL (a BookMyShow / District showtimes page, or an internal API
-request you grabbed from your browser's DevTools) and sends a Telegram
-message the moment a given theatre appears with booking open.
-
-State is tracked in state.json so you get alerted on the *transition*
-to "available" instead of on every run.
-
-Everything is driven by config.json (and/or environment variables), so
-nothing site-specific is hardcoded -- if BookMyShow/District change their
-markup you only edit config, not code.
-"""
 
 import json
 import os
@@ -21,19 +7,22 @@ import sys
 import time
 import urllib.parse
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import requests
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", ROOT / "config.json"))
 STATE_PATH = Path(os.environ.get("STATE_PATH", ROOT / "state.json"))
 
-# Look like a real Chrome on Windows -- BMS rejects obvious bots.
+
 DEFAULT_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
@@ -51,9 +40,17 @@ DEFAULT_HEADERS = {
 }
 
 
+THEATRES = {
+    "URBL": "Urvashi Cinema",
+    "VCCB": "Victory Cinema",
+    "PVOO": "PVR Orion Mall",
+}
+
+
 def load_json(path, default=None):
     if not path.exists():
         return default
+
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
 
@@ -66,7 +63,6 @@ def save_json(path, data):
 def load_config():
     cfg = load_json(CONFIG_PATH, default={}) or {}
 
-    # Environment variables override the file (used by GitHub Actions secrets).
     env_map = {
         "TARGET_URL": "target_url",
         "THEATRE": "theatre",
@@ -75,6 +71,7 @@ def load_config():
         "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
         "TELEGRAM_CHAT_ID": "telegram_chat_id",
     }
+
     for env_key, cfg_key in env_map.items():
         if os.environ.get(env_key):
             cfg[cfg_key] = os.environ[env_key]
@@ -82,222 +79,511 @@ def load_config():
     if os.environ.get("HEADERS_JSON"):
         cfg["headers"] = json.loads(os.environ["HEADERS_JSON"])
 
-    # The BMS date is embedded in the URL, so build the URL from the template
-    # and the (possibly overridden) requested_date. Set REQUESTED_DATE=20260717
-    # to point everything at the 17th for a live end-to-end test.
     if cfg.get("url_template") and cfg.get("requested_date"):
-        cfg["target_url"] = cfg["url_template"].format(date=cfg["requested_date"])
+        cfg["target_url"] = cfg["url_template"].format(
+            date=cfg["requested_date"]
+        )
 
-    required = ["target_url", "telegram_bot_token", "telegram_chat_id"]
+    required = [
+        "target_url",
+        "telegram_bot_token",
+        "telegram_chat_id",
+    ]
+
     detector = cfg.get("detector")
+
     if detector in ("bms_date", "venue_date"):
         required.append("requested_date")
     elif detector != "venue_date":
         required.append("theatre")
-    if detector == "venue_date" and not (cfg.get("venue_code") or cfg.get("venue_codes")):
-        sys.exit("venue_date detector needs 'venue_code' or 'venue_codes'")
+
+    if detector == "venue_date" and not (
+        cfg.get("venue_code") or cfg.get("venue_codes")
+    ):
+        sys.exit(
+            "venue_date detector needs 'venue_code' or 'venue_codes'"
+        )
+
     missing = [k for k in required if not cfg.get(k)]
+
     if missing:
-        sys.exit(f"Missing required config: {', '.join(missing)}")
+        sys.exit(
+            f"Missing required config: {', '.join(missing)}"
+        )
+
     return cfg
 
 
 def send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = requests.post(
+
+    response = requests.post(
         url,
-        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": False,
+        },
         timeout=30,
     )
-    resp.raise_for_status()
+
+    response.raise_for_status()
 
 
 def fetch(cfg):
-    """
-    Fetch the target URL from an India egress when configured.
-
-    BookMyShow blocks non-India / datacenter IPs (e.g. GitHub's US runners),
-    so a plain request from CI gets a 403. Two ways to route through India:
-
-    * SCRAPERAPI_KEY  -- routes via ScraperAPI with country_code=in and solves
-                         anti-bot. Easiest for CI. Set it as a repo secret.
-    * PROXY_URL       -- a standard http(s) proxy string, e.g.
-                         "http://user:pass@in-proxy-host:port".
-
-    With neither set, it makes a direct request with browser headers plus a
-    cookie warm-up -- enough only when running from an India IP.
-    """
     headers = dict(DEFAULT_HEADERS)
     headers.update(cfg.get("headers", {}))
 
     scraper_key = os.environ.get("SCRAPERAPI_KEY")
+
     if scraper_key:
         api_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(
-            {"api_key": scraper_key, "country_code": "in", "url": cfg["target_url"]}
+            {
+                "api_key": scraper_key,
+                "country_code": "in",
+                "url": cfg["target_url"],
+            }
         )
-        resp = requests.get(api_url, timeout=90)
-        resp.raise_for_status()
-        return resp.text
+
+        response = requests.get(
+            api_url,
+            timeout=90,
+        )
+
+        response.raise_for_status()
+
+        return response.text
 
     proxy = os.environ.get("PROXY_URL")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    proxies = (
+        {"http": proxy, "https": proxy}
+        if proxy
+        else None
+    )
 
     session = requests.Session()
     session.headers.update(headers)
 
-    # Warm-up: hit the homepage first to pick up cookies (helps soft bot checks).
     try:
-        session.get("https://in.bookmyshow.com/", timeout=30, proxies=proxies)
+        session.get(
+            "https://in.bookmyshow.com/",
+            timeout=30,
+            proxies=proxies,
+        )
     except requests.RequestException:
         pass
 
-    resp = session.get(
+    response = session.get(
         cfg["target_url"],
         timeout=30,
         proxies=proxies,
-        headers={"Referer": "https://in.bookmyshow.com/explore/movies-chennai"},
+        headers={
+            "Referer":
+                "https://in.bookmyshow.com/explore/movies-bengaluru"
+        },
     )
-    resp.raise_for_status()
-    return resp.text
+
+    response.raise_for_status()
+
+    return response.text
+
+
+def get_open_venues(page_text, cfg):
+    """
+    Check each target theatre independently.
+
+    BMS exposes a booking URL containing:
+        /<venue_code>/<date>
+
+    when that theatre is bookable for that exact date.
+    """
+
+    date = cfg["requested_date"]
+
+    codes = cfg.get("venue_codes")
+
+    if not codes:
+        codes = [cfg["venue_code"]]
+
+    open_venues = []
+
+    for code in codes:
+        pattern = f"/{code}/{date}"
+
+        if pattern.lower() in page_text.lower():
+            open_venues.append(code)
+
+    return open_venues
+
+
+def is_available_venue_date(page_text, cfg):
+    return bool(
+        get_open_venues(page_text, cfg)
+    )
 
 
 def is_available_bms_date(page_text, cfg):
-    """
-    BookMyShow-specific detector for "a given date has opened for booking".
+    requested = cfg["requested_date"]
 
-    BMS only renders showtimes for the date currently being displayed, and it
-    silently falls back to the nearest available date when you request a date
-    that hasn't opened yet. So the requested date (e.g. 20260720) sits at a
-    low ~3 count (just the date-strip navigation) until it opens, at which
-    point its showtimes render and it becomes the *dominant* date token.
+    floor = cfg.get(
+        "min_references",
+        10,
+    )
 
-    Rule: open when the requested date is the most-referenced date token on
-    the page and it clears a small floor (well above strip-only noise).
-    """
-    requested = cfg["requested_date"]  # e.g. "20260720"
-    floor = cfg.get("min_references", 10)
+    tokens = re.findall(
+        r"20\d{6}",
+        page_text,
+    )
 
-    tokens = re.findall(r"20\d{6}", page_text)
     if not tokens:
         return False
 
     counts = Counter(tokens)
+
     top_date, _ = counts.most_common(1)[0]
-    requested_count = counts.get(requested, 0)
 
-    return top_date == requested and requested_count >= floor
+    requested_count = counts.get(
+        requested,
+        0,
+    )
 
-
-def is_available_venue_date(page_text, cfg):
-    """
-    Theatre-specific detector: is a given venue bookable on a given date?
-
-    BMS renders a per-venue booking link like
-        /cinemas/chennai/<slug>/buytickets/<venueCode>/<date>
-    only when that venue has live shows for that exact date. Because the date
-    is baked into the link, it can't be confused with the silent fallback
-    (a fallback page carries /<code>/<fallbackDate>, not /<code>/<ourDate>).
-
-    Set venue_code (one) or venue_codes (list). With a list, it's open when
-    ANY of them is bookable for the date.
-    """
-    date = cfg["requested_date"]
-    codes = cfg.get("venue_codes") or [cfg["venue_code"]]
-    return any("/{}/{}".format(code, date) in page_text for code in codes)
-
-
-def is_available(page_text, cfg):
-    detector = cfg.get("detector")
-    if detector == "venue_date":
-        return is_available_venue_date(page_text, cfg)
-    if detector == "bms_date":
-        return is_available_bms_date(page_text, cfg)
-    return is_available_generic(page_text, cfg)
+    return (
+        top_date == requested
+        and requested_count >= floor
+    )
 
 
 def is_available_generic(page_text, cfg):
-    """
-    Booking is considered OPEN for the target theatre when the theatre name
-    is present AND at least one 'booking is live' signal is present.
+    haystack = re.sub(
+        r"\s+",
+        " ",
+        page_text,
+    ).lower()
 
-    Matching is case-insensitive and ignores extra whitespace so small
-    formatting differences don't cause misses.
-    """
-    haystack = re.sub(r"\s+", " ", page_text).lower()
+    theatre = re.sub(
+        r"\s+",
+        " ",
+        cfg["theatre"],
+    ).lower().strip()
 
-    theatre = re.sub(r"\s+", " ", cfg["theatre"]).lower().strip()
     if theatre not in haystack:
         return False
 
-    # If the movie name is configured, require it too (avoids false hits when
-    # the theatre is listed for other movies).
     movie = cfg.get("movie")
+
     if movie:
-        if re.sub(r"\s+", " ", movie).lower().strip() not in haystack:
+        movie_normalized = re.sub(
+            r"\s+",
+            " ",
+            movie,
+        ).lower().strip()
+
+        if movie_normalized not in haystack:
             return False
 
-    # Signals that booking is actually live rather than "coming soon".
     open_signals = cfg.get(
         "open_signals",
-        ["book tickets", "book now", '"showtimes"', "showtime", "select seats"],
+        [
+            "book tickets",
+            "book now",
+            '"showtimes"',
+            "showtime",
+            "select seats",
+        ],
     )
-    # Signals that it's NOT yet open -- if present near-exclusively, treat as closed.
-    closed_signals = cfg.get("closed_signals", ["notify me", "coming soon"])
 
-    has_open = any(s.lower() in haystack for s in open_signals)
-    only_closed = any(s.lower() in haystack for s in closed_signals) and not has_open
+    closed_signals = cfg.get(
+        "closed_signals",
+        [
+            "notify me",
+            "coming soon",
+        ],
+    )
+
+    has_open = any(
+        signal.lower() in haystack
+        for signal in open_signals
+    )
+
+    only_closed = (
+        any(
+            signal.lower() in haystack
+            for signal in closed_signals
+        )
+        and not has_open
+    )
 
     return has_open and not only_closed
 
 
-def main():
-    cfg = load_config()
-    state = load_json(STATE_PATH, default={"available": False}) or {"available": False}
+def is_available(page_text, cfg):
+    detector = cfg.get("detector")
 
-    target_desc = cfg.get("theatre") or cfg.get("requested_date", "target")
-    label = f"{cfg.get('movie', 'movie')} @ {target_desc}"
+    if detector == "venue_date":
+        return is_available_venue_date(
+            page_text,
+            cfg,
+        )
+
+    if detector == "bms_date":
+        return is_available_bms_date(
+            page_text,
+            cfg,
+        )
+
+    return is_available_generic(
+        page_text,
+        cfg,
+    )
+
+
+def send_status_update(
+    cfg,
+    open_venues,
+    checked_at,
+):
+    requested_date = cfg["requested_date"]
+
+    pretty_date = (
+        f"{requested_date[6:8]}-"
+        f"{requested_date[4:6]}-"
+        f"{requested_date[0:4]}"
+    )
+
+    lines = [
+        "🔎 Toxic BMS Status",
+        "",
+        "🎬 Toxic: A Fairy Tale for Grown-ups",
+        f"📅 {pretty_date}",
+        "",
+    ]
+
+    for code, name in THEATRES.items():
+
+        if code in open_venues:
+            status = "🚨 BOOKING OPEN"
+        else:
+            status = "❌ Not released"
+
+        lines.append(
+            f"{status} — {name}"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"🕐 Checked: {checked_at}",
+            "🔄 Next check: ~1 minute",
+        ]
+    )
+
+    send_telegram(
+        cfg["telegram_bot_token"],
+        cfg["telegram_chat_id"],
+        "\n".join(lines),
+    )
+
+
+def send_booking_alert(
+    cfg,
+    open_venues,
+):
+    requested_date = cfg["requested_date"]
+
+    pretty_date = (
+        f"{requested_date[6:8]}-"
+        f"{requested_date[4:6]}-"
+        f"{requested_date[0:4]}"
+    )
+
+    venue_names = [
+        THEATRES.get(
+            code,
+            code,
+        )
+        for code in open_venues
+    ]
+
+    message = (
+        "🚨 TOXIC BOOKINGS OPEN!\n\n"
+        "🎬 Toxic: A Fairy Tale for Grown-ups\n"
+        f"📅 {pretty_date}\n\n"
+        "✅ Booking available at:\n"
+        + "\n".join(
+            f"• {name}"
+            for name in venue_names
+        )
+        + "\n\n"
+        f"🎟️ Book now:\n{cfg['target_url']}"
+    )
+
+    send_telegram(
+        cfg["telegram_bot_token"],
+        cfg["telegram_chat_id"],
+        message,
+    )
+
+
+def main():
+
+    cfg = load_config()
+
+    state = load_json(
+        STATE_PATH,
+        default={
+            "available": False,
+        },
+    ) or {
+        "available": False,
+    }
+
+    target_desc = (
+        cfg.get("theatre")
+        or cfg.get(
+            "requested_date",
+            "target",
+        )
+    )
+
+    label = (
+        f"{cfg.get('movie', 'movie')}"
+        f" @ {target_desc}"
+    )
 
     try:
         page = fetch(cfg)
+
     except requests.RequestException as exc:
-        # Transient network/blocking errors shouldn't crash the workflow.
-        print(f"[{label}] fetch failed: {exc}")
+
+        print(
+            f"[{label}] fetch failed: {exc}"
+        )
+
         return 0
 
-    available = is_available(page, cfg)
-    print(f"[{label}] available={available} (was {state.get('available')})")
+    open_venues = []
 
-    if available and not state.get("available"):
-        if cfg.get("detector") in ("bms_date", "venue_date"):
-            rd = cfg["requested_date"]
-            pretty = f"{rd[6:8]}-{rd[4:6]}-{rd[0:4]}"
-            venue = cfg.get("venue_label") or cfg.get("venue_code") or ""
-            venue_line = f"Theatre: {venue}\n" if venue else ""
-            msg = (
-                f"🎬 Booking just OPENED!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"{venue_line}"
-                f"Date: {pretty}\n\n"
-                f"Book here: {cfg['target_url']}"
+    if cfg.get("detector") == "venue_date":
+
+        open_venues = get_open_venues(
+            page,
+            cfg,
+        )
+
+        available = bool(
+            open_venues
+        )
+
+    else:
+
+        available = is_available(
+            page,
+            cfg,
+        )
+
+    previous_available = state.get(
+        "available",
+        False,
+    )
+
+    print(
+        f"[{label}] "
+        f"available={available} "
+        f"(was {previous_available})"
+    )
+
+    if open_venues:
+        print(
+            "Open venues:",
+            ", ".join(open_venues),
+        )
+
+    # -------------------------------------------------
+    # IMMEDIATE BOOKING ALERT
+    # -------------------------------------------------
+
+    if available and not previous_available:
+
+        if cfg.get("detector") == "venue_date":
+
+            send_booking_alert(
+                cfg,
+                open_venues,
             )
+
         else:
-            msg = (
-                f"🎬 Booking is OPEN!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"Theatre: {cfg['theatre']}\n\n"
-                f"Book here: {cfg['target_url']}"
-            )
-        send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
-        print(f"[{label}] notification sent")
 
-    # Persist current state so we don't re-alert every run.
-    if available != state.get("available"):
+            requested_date = cfg["requested_date"]
+
+            pretty_date = (
+                f"{requested_date[6:8]}-"
+                f"{requested_date[4:6]}-"
+                f"{requested_date[0:4]}"
+            )
+
+            message = (
+                "🚨 TOXIC BOOKINGS OPEN!\n\n"
+                f"🎬 {cfg.get('movie', 'Movie')}\n"
+                f"📅 {pretty_date}\n\n"
+                f"🎟️ Book now:\n"
+                f"{cfg['target_url']}"
+            )
+
+            send_telegram(
+                cfg["telegram_bot_token"],
+                cfg["telegram_chat_id"],
+                message,
+            )
+
+        print(
+            f"[{label}] notification sent"
+        )
+
+    # -------------------------------------------------
+    # 10-MINUTE HEARTBEAT
+    # -------------------------------------------------
+
+    now = datetime.now()
+
+    if now.minute % 10 == 0:
+
+        checked_at = now.strftime(
+            "%I:%M %p"
+        )
+
+        send_status_update(
+            cfg,
+            open_venues,
+            checked_at,
+        )
+
+        print(
+            f"[{label}] "
+            "10-minute status sent"
+        )
+
+    # -------------------------------------------------
+    # SAVE CURRENT AVAILABILITY
+    # -------------------------------------------------
+
+    if available != previous_available:
+
         state["available"] = available
-        state["checked_at"] = int(time.time())
-        save_json(STATE_PATH, state)
+
+        state["checked_at"] = int(
+            time.time()
+        )
+
+        save_json(
+            STATE_PATH,
+            state,
+        )
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )
